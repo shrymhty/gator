@@ -54,8 +54,11 @@ func main() {
 		registered: make(map[string]func(*state, command)error),
 	}
 
+	// commands and their handlers
 	cmds.register("login", handlerLogin)
 	cmds.register("register", handleRegister)
+	cmds.register("reset", handleReset)
+	cmds.register("users", handleUsers)
 
 	if len(os.Args) < 2 {
 		fmt.Println("Error: not enough arguments provided")
@@ -131,6 +134,39 @@ func handleRegister(s *state, cmd command) error {
 	fmt.Printf("User %s created sucessfully!\n", name)
 	fmt.Printf("Created user:\n%v\n", user)
 
+	return nil
+}
+
+func handleReset(s *state, cmd command) error {
+	if len(cmd.args) > 0 {
+		return fmt.Errorf("Extra arguments passed.")
+	}
+
+	err := s.db.DeleteUsers(context.Background())
+	if err != nil {
+		return fmt.Errorf("Error deleting user data. Error: %w", err)
+	}
+
+	return nil
+}
+
+func handleUsers(s *state, cmd command) error {
+	if len(cmd.args) > 0 {
+		return fmt.Errorf("Extra arguments passed.")
+	}
+
+	users, err := s.db.GetUsers(context.Background())
+	if err != nil {
+		return fmt.Errorf("Error geting user names. Error: %w", err)
+	}
+
+	for _, user := range users {
+		name := user.Name
+		if s.cfg.CurrentUserName == user.Name {
+			name = name + " (current)"
+		}
+		fmt.Println("* " + name)
+	}
 	return nil
 }
 
