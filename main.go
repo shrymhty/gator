@@ -1,13 +1,20 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"os"
+	"time"
 
+	"github.com/google/uuid"
+	_ "github.com/lib/pq"
 	"github.com/shrymhty/gator/internal/config"
+	"github.com/shrymhty/gator/internal/database"
 )
 
 type state struct {
+	db *database.Queries
 	cfg *config.Config
 }
 
@@ -34,11 +41,21 @@ func main() {
 		cfg: cfg,
 	}
 
+	// database connection
+	db, err := sql.Open("postgres", s.cfg.DbUrl)
+	if err != nil {
+		fmt.Println("Error connecting to database")
+	}
+
+	dbQueries := database.New(db)
+	s.db = dbQueries
+
 	cmds := &commands{
 		registered: make(map[string]func(*state, command)error),
 	}
 
 	cmds.register("login", handlerLogin)
+	cmds.register("register", handleRegister)
 
 	if len(os.Args) < 2 {
 		fmt.Println("Error: not enough arguments provided")
@@ -64,12 +81,56 @@ func handlerLogin(s *state, cmd command) error {
 	if len(cmd.args) == 0 {
 		return fmt.Errorf("Error: Login handler expects a single argument, the username.")
 	}
-	err := s.cfg.SetUser(cmd.args[0])
+
+	name := cmd.args[0]
+	_, err := s.db.GetUser(context.Background(), name)
+	if err != nil {
+		return fmt.Errorf("User doesn't exist. Cannot login to user. Error: %w", err)
+	}
+
+	err = s.cfg.SetUser(name)
 	if err != nil {
 		return err
 	}
 	
 	fmt.Println("User has been set!")
+	return nil
+}
+
+func handleRegister(s *state, cmd command) error {
+	if len(cmd.args) == 0 {
+		return fmt.Errorf("Error: Register handler expects a single argument, the username.")
+	}
+
+	name := cmd.args[0]
+
+	_, err := s.db.GetUser(context.Background(), name)
+	if err == nil {
+		return fmt.Errorf("User already exists in the database")
+	}
+	if err != sql.ErrNoRows {
+		return fmt.Errorf("database error: %w", err)
+	}
+
+	// Create the user
+	user, err := s.db.CreateUser(context.Background(), database.CreateUserParams{
+		ID: uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		Name: name,
+	})
+	if err != nil {
+		return fmt.Errorf("Could not create user %s. Error: %w", name, err)
+	}
+
+	err = s.cfg.SetUser(name)
+	if err != nil {
+		return fmt.Errorf("Error setting user %s to config. Error: %w", name, err)
+	}
+
+	fmt.Printf("User %s created sucessfully!\n", name)
+	fmt.Printf("Created user:\n%v\n", user)
+
 	return nil
 }
 
