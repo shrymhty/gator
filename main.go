@@ -80,10 +80,11 @@ func main() {
 	cmds.register("reset", handleReset)
 	cmds.register("users", handleUsers)
 	cmds.register("agg", handleAgg)
-	cmds.register("addfeed", HandleAddFeed)
+	cmds.register("addfeed", middlewareUserLoggedIn(HandleAddFeed))
 	cmds.register("feeds", handleFeeds)
-	cmds.register("follow", handleFollow)
-	cmds.register("following", handleFollowing)
+	cmds.register("follow", middlewareUserLoggedIn(handleFollow))
+	cmds.register("following", middlewareUserLoggedIn(handleFollowing))
+	cmds.register("unfollow", middlewareUserLoggedIn(handleUnfollow))
 
 	if len(os.Args) < 2 {
 		fmt.Println("Error: not enough arguments provided")
@@ -195,21 +196,17 @@ func handleUsers(s *state, cmd command) error {
 	return nil
 }
 
-func HandleAddFeed(s *state, cmd command) error {
+func HandleAddFeed(s *state, cmd command, user database.User) error {
 	if len(cmd.args) < 2 {
 		return fmt.Errorf("Error: not enough arguments provided")
 	}
 
 	currentUser := s.cfg.CurrentUserName
-	user, err := s.db.GetUser(context.Background(), currentUser)
-	if err != nil {
-		return fmt.Errorf("Troubling fetching current username. Error: %w", err)
-	}
 
 	name := cmd.args[0]
 	url := cmd.args[1]
 
-	_, err = s.db.CreateFeed(context.Background(), database.CreateFeedParams{
+	_, err := s.db.CreateFeed(context.Background(), database.CreateFeedParams{
 		ID: uuid.New(),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
@@ -246,18 +243,12 @@ func handleFeeds(s *state, cmd command) error {
 	return nil
 }
 
-func handleFollow(s *state, cmd command) error {
+func handleFollow(s *state, cmd command, user database.User) error {
 	if len(cmd.args) != 1 {
 		return fmt.Errorf("Expects only 1 argument. Received %d.", len(cmd.args))
 	}
 
-	currentUser := s.cfg.CurrentUserName
 	url := cmd.args[0]
-	
-	user, err := s.db.GetUser(context.Background(), currentUser)
-	if err != nil {
-		return fmt.Errorf("Error getting user details. Error: %w", err)
-	}
 
 	feed, err := s.db.GetFeedByUrl(context.Background(), url)
 	if err != nil {
@@ -270,18 +261,17 @@ func handleFollow(s *state, cmd command) error {
 	}
 
 	fmt.Println("Record created successfully: ")
-	fmt.Printf("* Feed: %s\n  User: %s\n", feed.Name, currentUser)
+	fmt.Printf("* Feed: %s\n  User: %s\n", feed.Name, user.Name)
 
 	return nil
 }
 
-func handleFollowing(s *state, cmd command) error {
+func handleFollowing(s *state, cmd command, user database.User) error {
 	if len(cmd.args) > 0 {
 		return fmt.Errorf("Error executing command. Command expects 0 arguments")
 	}
 
-	name := s.cfg.CurrentUserName
-	feeds, err := s.db.GetFeedFollowsForUser(context.Background(), name)
+	feeds, err := s.db.GetFeedFollowsForUser(context.Background(), user.Name)
 	if err != nil {
 		return fmt.Errorf("Error fetching records. Error: %w", err)
 	}
@@ -289,6 +279,29 @@ func handleFollowing(s *state, cmd command) error {
 	fmt.Println("Feed Names:")
 	for _, feed := range feeds {
 		fmt.Println(feed.FeedName)
+	}
+
+	return nil
+}
+
+func handleUnfollow(s *state, cmd command, user database.User) error {
+	if len(cmd.args) != 1 {
+		return fmt.Errorf("Command expects only 1 argument. Recieved %d", len(cmd.args))
+	}
+
+	url := cmd.args[0]
+	
+	feed, err := s.db.GetFeedByUrl(context.Background(), url)
+	if err != nil {
+		return fmt.Errorf("Error fetching feed details. Error: %w", err)
+	}
+
+	err = s.db.DeleteFeedFollow(context.Background(), database.DeleteFeedFollowParams{
+		UserID: user.ID,
+		FeedID: feed.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("Error deleting feed follow record. Error: %w", err)
 	}
 
 	return nil
@@ -376,4 +389,15 @@ func handleAgg(s *state, cmd command) error {
 
 	fmt.Println(result)
 	return nil
+}
+
+// middleware
+func middlewareUserLoggedIn(handler func(s *state, cmd command, user database.User) error) func (*state, command) error {
+	return func (s *state, cmd command) error {
+		user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
+		if err != nil {
+			return fmt.Errorf("Error getting user details. Error: %w", err)
+		}
+		return handler(s, cmd, user)
+	} 
 }
