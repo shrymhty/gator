@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,18 +22,22 @@ import (
 type state struct {
 	db *database.Queries
 	cfg *config.Config
+	cmds *commands
 }
-
-// var supportedCommands map[string]command
 
 type command struct {
 	name string
-	// description string
 	args []string
 }
 
+type commandHandler struct {
+	fn func(*state, command) error
+	desc string
+}
+
 type commands struct {
-	registered map[string]func(*state, command) error
+	// registered map[string]func(*state, command) error
+	registered map[string]commandHandler
 }
 
 type RSSfeed struct {
@@ -71,23 +77,27 @@ func main() {
 	s.db = dbQueries
 
 	cmds := &commands{
-		registered: make(map[string]func(*state, command)error),
+		registered: make(map[string]commandHandler),
 	}
+
+	s.cmds = cmds
 
 	// fetch feeds
 	go scrapeFeeds(s)
 
 	// commands and their handlers
-	cmds.register("login", handlerLogin)
-	cmds.register("register", handleRegister)
-	cmds.register("reset", handleReset)
-	cmds.register("users", handleUsers)
-	cmds.register("agg", handleAgg)
-	cmds.register("addfeed", middlewareUserLoggedIn(HandleAddFeed))
-	cmds.register("feeds", handleFeeds)
-	cmds.register("follow", middlewareUserLoggedIn(handleFollow))
-	cmds.register("following", middlewareUserLoggedIn(handleFollowing))
-	cmds.register("unfollow", middlewareUserLoggedIn(handleUnfollow))
+	cmds.register("login", handlerLogin, "login to CLI as a specific user")
+	cmds.register("register", handleRegister, "create a new user")
+	cmds.register("reset", handleReset, "reset the database")
+	cmds.register("users", handleUsers, "get list of existing users")
+	cmds.register("agg", handleAgg, "start the feed aggregator")
+	cmds.register("addfeed", middlewareUserLoggedIn(HandleAddFeed), "add feed details to database for current user")
+	cmds.register("feeds", handleFeeds, "retrive feed details")
+	cmds.register("follow", middlewareUserLoggedIn(handleFollow), "follow the feed for current user")
+	cmds.register("following", middlewareUserLoggedIn(handleFollowing), "fetching feeds for current user")
+	cmds.register("unfollow", middlewareUserLoggedIn(handleUnfollow), "unfollow feed for current user")
+	cmds.register("browse", middlewareUserLoggedIn(handleBrowse), "browse followed feeds for current user")
+	cmds.register("help", handleHelp, "display the help menu")
 
 	if len(os.Args) < 2 {
 		fmt.Println("Error: not enough arguments provided")
@@ -336,14 +346,19 @@ func (c *commands) run(s *state, cmd command) error {
 		return fmt.Errorf("command %s does not exist", cmd.name)
 	}
 
-	return handler(s, cmd)
+	return handler.fn(s, cmd)
 }
 
-func (c *commands) register(name string, f func(*state, command) error) {
+func (c *commands) register(name string, f func(*state, command) error, description string) {
 	if c.registered ==  nil {
-		c.registered = make(map[string]func(*state, command) error)
+		c.registered = make(map[string]commandHandler)
 	}
-	c.registered[name] = f
+	cmdHdlr := commandHandler{
+		fn: f,
+		desc: description,
+	}
+	c.registered[name] = cmdHdlr
+
 }
 
 func fetchFeed(ctx context.Context, feedUrl string) (*RSSfeed, error) {
@@ -399,7 +414,6 @@ func handleAgg(s *state, cmd command) error {
 	for ; ; <-ticker.C {
 		scrapeFeeds(s)
 	}
-	return nil
 }
 
 // middleware
@@ -418,7 +432,7 @@ func scrapeFeeds(s *state) {
 	for {
 		feed, err := s.db.GetNextFeedToFetch(context.Background())
 		if err != nil {
-			fmt.Printf("Error fetching next feed details. Error: %w\n", err)
+			fmt.Printf("Error fetching next feed details.\n")
 		}
 
 		err = s.db.MarkFeedFetched(context.Background(), database.MarkFeedFetchedParams{
@@ -426,16 +440,87 @@ func scrapeFeeds(s *state) {
 			ID: feed.ID,
 		})
 		if err != nil {
-			fmt.Printf("Error marking feed as fetched. Error: %w\n", err)
+			fmt.Printf("Error marking feed as fetched.\n")
 		}
 
 		feedDetails, err := fetchFeed(context.Background(), feed.Url)
 		if err != nil {
-			fmt.Printf("Error fetching feed by url. Error: %w\n", err)
+			fmt.Printf("Error fetching feed by url.")
 		}
 
 		for _, f := range feedDetails.Channel.Item {
-			fmt.Printf("* %s\n", f.Title)
+			pubDate := parsePubDate(f.PubDate)
+
+			_, err := s.db.CreatePost(context.Background(), database.CreatePostParams{
+				ID: uuid.New(),
+				CreatedAt: time.Now(),
+				UpdatedAt: time.Now(),
+				Title: f.Title,
+				Url: f.Link,
+				Description: f.Description,
+				PublishedAt: pubDate,
+				FeedID: feed.ID,
+			})
+
+			if err != nil {
+				if strings.Contains(err.Error(), "pq: duplicate key value violates unique constraint") {
+                continue
+            }
+            fmt.Printf("Error saving post %s: %v\n", f.Title, err)
+			}
 		}
 	}
+}
+
+func parsePubDate(date string) time.Time {
+	formats := []string{
+        time.RFC1123Z,
+        time.RFC1123,
+        time.RFC3339,
+        "Mon, 02 Jan 2006 15:04:05 MST",
+        "2006-01-02T15:04:05Z07:00",
+    }
+
+	for _, f := range formats {
+        if t, err := time.Parse(f, date); err == nil {
+            return t
+        }
+    }
+
+    return time.Now()
+}
+
+func handleBrowse(s *state, cmd command, user database.User) error {
+	limit := 2
+	if len(cmd.args) == 1 {
+		parsedLimit, err := strconv.Atoi(cmd.args[0])
+		if err != nil {
+			return fmt.Errorf("Invalid limit: %w", err)
+		}
+		limit = parsedLimit
+	}
+
+	posts, err := s.db.GetPostsByUser(context.Background(), database.GetPostsByUserParams{
+		ID: user.ID,
+		Limit: int32(limit),
+	})
+
+	if err != nil {
+		return fmt.Errorf("Error fetching posts. Error: %w", err)
+	}
+
+	for _, post := range posts {
+		fmt.Println(post)
+	}
+
+	return nil	
+}
+
+func handleHelp(s *state, cmd command) error {
+	fmt.Printf("Usage: ./gator <command> [<args>]\n\n")
+	fmt.Println("Commands:")
+	for name, handler := range s.cmds.registered {
+		fmt.Printf("  %-10s : %s\n", name, handler.desc)
+	}
+	return nil
 }
